@@ -550,6 +550,12 @@ CONFIG_FILE_EXTENSIONS = {".yml", ".yaml"}
 
 KYTHE_DIR = "/usr/local/kythe"
 
+INDEX_UPLOAD_POLICY_ALWAYS = "Always"
+
+INDEX_UPLOAD_POLICY_IF_BUILD_SUCCESS = "IfBuildSuccess"
+
+INDEX_UPLOAD_POLICY_NEVER = "Never"
+
 class BuildkiteException(Exception):
     """
     Raised whenever something goes wrong and we should exit with an error.
@@ -1144,18 +1150,33 @@ def execute_commands(
 
         if index_targets:
             index_flags, json_profile_out_index = calculate_flags(task_config, "index_flags", "index", tmpdir, test_env_vars)
+            index_upload_policy = task_config.get("index_upload_policy", "IfBuildSuccess")
 
             try:
-                execute_bazel_build_with_kythe(
-                    bazel_version,
-                    bazel_binary,
-                    platform,
-                    index_flags,
-                    index_targets,
-                    None,
-                    incompatible_flags
-                )
-                merge_and_upload_kythe_kzip(platform)
+                should_upload_kzip = True if index_upload_policy == INDEX_UPLOAD_POLICY_ALWAYS else False
+                try:
+                    execute_bazel_build_with_kythe(
+                        bazel_version,
+                        bazel_binary,
+                        platform,
+                        index_flags,
+                        index_targets,
+                        None,
+                        incompatible_flags
+                    )
+
+                    if index_upload_policy == INDEX_UPLOAD_POLICY_IF_BUILD_SUCCESS:
+                        should_upload_kzip = True
+                except subprocess.CalledProcessError as e:
+                    # If not running with Always policy, raise the build error.
+                    if index_upload_policy != INDEX_UPLOAD_POLICY_ALWAYS:
+                        handle_bazel_failure(e, "build")
+
+                if should_upload_kzip:
+                    try:
+                        merge_and_upload_kythe_kzip(platform)
+                    except subprocess.CalledProcessError:
+                        raise BuildkiteException("Failed to upload kythe kzip")
             finally:
                 if json_profile_out_index:
                     upload_json_profile(json_profile_out_index, tmpdir)
@@ -1729,21 +1750,18 @@ def execute_bazel_build_with_kythe(
     )
 
     print_expanded_group(":bazel: Build ({})".format(bazel_version))
-    try:
-        execute_command(
-            [bazel_binary]
-            + bazelisk_flags()
-            + common_startup_flags(platform)
-            + kythe_startup_flags()
-            + ["build"]
-            + kythe_build_flags()
-            + aggregated_flags
-            + ["--"]
-            + targets
-        )
-    except subprocess.CalledProcessError as e:
-        msg = "bazel build failed with exit code {}".format(e.returncode)
-        print_collapsed_group(msg)
+
+    execute_command(
+        [bazel_binary]
+        + bazelisk_flags()
+        + common_startup_flags(platform)
+        + kythe_startup_flags()
+        + ["build"]
+        + kythe_build_flags()
+        + aggregated_flags
+        + ["--"]
+        + targets
+    )
 
 
 def calculate_targets(task_config, platform, bazel_binary, build_only, test_only):
